@@ -1,0 +1,840 @@
+#!/usr/bin/env python3
+"""BOSS 直聘投递 · 投递原语库 + 收尾（实时单卡投递由 _live_driver.py 驱动）
+
+架构（v6.9 起）：
+  - _live_driver.py 负责「智能体交互层」：walk / open / deliver / reject 单卡游标，
+    把每步动作交给浏览器，方向判断（该不该投）由 AI 语义完成，脚本只做两道
+    机械硬门槛（城市 + 薪资下限），绝不硬编码岗位类型/行业关键词。
+  - 本文件 phase_stream.py 提供「投递共享原语 + 收尾」：
+      ① 浏览器操作原语：滚动懒加载、读 JD、弹窗识别/关闭、面板校验、
+         推荐页内原地投递 deliver_click、每步 DOM 回读校验；
+      ② 收尾：write_summary_page（--mode report，投递成果汇报 + 打赏码二合一 HTML）；
+      ③ 独立诊断：run_verify（--mode verify，交叉核对真实沟通列表，读后自动回推荐页）；
+      ④ 诊断模式：--diag（只读 dump 浮层 + 弹窗分类 + 日上限检测，不投递）。
+
+设计铁律（与筛选无关，平台级）：
+  - 每次投递都回读页面确认「送达」才继续；遇未知弹窗 / 误触 / 日上限 立即整批停手。
+  - 弹窗只点白名单关闭键（留在此页/继续沟通/取消/关闭/稍后），绝不点发送/上传类按钮。
+  - 连续投递失败熔断（FAIL_BREAKER）：连续 ≥3 次失败/超时即停手。
+  - 投递全程停在推荐页/搜索页，绝不把会话停在 /chat。
+
+用法（仅收尾/诊断，投递主流程在 _live_driver.py）：
+    python scripts/phase_stream.py --workdir <目录> --mode report
+    python scripts/phase_stream.py --workdir <目录> --mode verify
+    python scripts/phase_stream.py --workdir <目录> --diag
+"""
+import sys, os, time, json
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+# 兼容 Git Bash 的 /c/... UNIX 风格路径：Windows Python 会把 /c 误算成 C:\c
+if len(_HERE) >= 3 and _HERE[0] == "/" and _HERE[1].isalpha() and _HERE[2] == "/":
+    _HERE = _HERE[1].upper() + ":" + _HERE[2:]
+SKILL_DIR = os.path.dirname(_HERE)
+if SKILL_DIR not in sys.path:
+    sys.path.insert(0, SKILL_DIR)
+
+from scripts.webbridge_client import (
+    SESSION, api, evaluate, extract_jobs, detect_page_anomaly,
+    ProgressManager, parse_salary_max, wait_for_feedback, AbortScriptError,
+    navigate, snapshot_page, click,
+)
+from scripts.config_v3 import load_profile
+from scripts.env_check import check_env
+
+RECOMMEND_URL = "https://www.zhipin.com/web/geek/jobs?ka=header-jobs"
+# 仅用于 _ensure_recommend 判定当前是否已在 BOSS 工作页（推荐页/搜索页同路径，仅 query 不同）
+WORKING_URL = RECOMMEND_URL
+
+
+def search_url_for(query, city_code):
+    from urllib.parse import quote
+    if not query:
+        # 无关键词 → 返回 BOSS 推荐页（用户个性化 feed，命中率最高，walk 默认起点）
+        return RECOMMEND_URL
+    return f"https://www.zhipin.com/web/geek/jobs?query={quote(query)}&city={city_code}"
+
+
+def scroll_jobs_list(session=SESSION, times=1):
+    """滚动左侧岗位列表到底部，触发 BOSS 懒加载更多卡片。
+
+    适配推荐页与关键词搜索页：每次把 .job-list（或其最近可滚祖先 / 页面）滚到底，
+    等待 BOSS 渲染下一批。懒加载的真正「到底」由 _live_driver 的 _exhaust_recommend_feed
+    （滚动→等 3s→连续 4 次稳定才停）判定，本函数只负责单次触发。
+    """
+    for _ in range(max(1, times)):
+        evaluate(r"""(function(){
+            var list = document.querySelector('#main .job-list') || document.querySelector('.job-list');
+            if (list && list.scrollHeight > list.clientHeight + 4) {
+                list.scrollTop = list.scrollHeight;
+            } else {
+                var p = list;
+                while (p && p !== document.body) {
+                    if (p.scrollHeight > p.clientHeight + 4 && p.clientHeight > 0) {
+                        p.scrollTop = p.scrollHeight; return;
+                    }
+                    p = p.parentElement;
+                }
+                window.scrollTo(0, document.body.scrollHeight);
+            }
+        })()""")
+        time.sleep(1.2)
+
+
+# ───────────────────────────────────────────────────────────
+# 读取 JD（点击卡片 → 右侧面板切换 → 抽取 JD 文本）
+# ───────────────────────────────────────────────────────────
+JD_JS = r"""
+(function(){
+    function grab(sel){ var el=document.querySelector(sel); return el? el.innerText.trim(): null; }
+    var detail = grab('#main .job-detail') || grab('.job-detail') || grab('.detail-content')
+                 || grab('.job-detail-box') || grab('div.detail-content');
+    if (detail) return '=== JD面板 ===\n' + detail;
+    var main = document.querySelector('#main');
+    if (main){ var list = main.querySelector('.job-list'); if (list) list.remove();
+        return '=== #main(已去左列表) ===\n' + main.innerText.trim(); }
+    return '=== body兜底 ===\n' + (document.body.innerText||'').trim();
+})()
+"""
+
+def read_jd(job, session=SESSION):
+    ptype = read_popup_type(session)
+    if ptype in ("not_interested", "unknown"):
+        raise AbortScriptError(f"读JD前检测到危险弹窗({ptype})，停止待人工介入")
+    if ptype:
+        safe_close_popup(session)
+    jid = job.get("jobId")
+    sel = f'a[href*="job_detail/{jid}"]'
+    r = click(sel)
+    time.sleep(3)
+    return evaluate(JD_JS) or ""
+
+
+# ═══════════════════════════════════════════════════════════
+# 通用可见浮层扫描（取代固定选择器白名单）
+# ═══════════════════════════════════════════════════════════
+OVERLAY_SCAN_JS = r"""
+function _ovVis(el){ if(!el) return false; var s; try{s=getComputedStyle(el);}catch(e){return true;}
+    if(s.display==='none'||s.visibility==='hidden'||+s.opacity===0) return false;
+    if(el.offsetParent===null && el.tagName!=='BODY' && el.tagName!=='HTML'){
+        var p=s.position; if(p!=='fixed'&&p!=='absolute') return false; }
+    return true; }
+function _ovIs(el){ var s; try{s=getComputedStyle(el);}catch(e){s={};}
+    if(el.getAttribute('role')==='dialog'||el.getAttribute('role')==='alertdialog') return true;
+    var cls=(''+(el.className||'')).toLowerCase();
+    if(/mask|modal|dialog|popup|overlay|drawer|toast|layer|chat-block|greet|confirm/.test(cls)) return true;
+    if(s.position==='fixed'||s.position==='absolute'){
+        var t=(el.innerText||'').replace(/\s+/g,' ').trim();
+        if(/不感兴趣|上传附件|已向BOSS|上限|沟通次数|确定|取消|发送|继续沟通|留在此页/.test(t)) return true; }
+    return false; }
+function _ovScan(){ var out=[]; var all=document.querySelectorAll('*');
+    for(var i=0;i<all.length;i++){ var el=all[i]; if(!_ovVis(el)) continue; if(!_ovIs(el)) continue;
+        var t=(el.innerText||el.textContent||'').replace(/\s+/g,' ').trim(); if(!t||t.length<2) continue;
+        var s; try{s=getComputedStyle(el);}catch(e){s={position:'',zIndex:'0'};}
+        out.push({tag:el.tagName, cls:(''+(el.className||'')).slice(0,60), pos:s.position, z:(parseInt(s.zIndex,10)||0), text:t.slice(0,200)}); }
+    out.sort(function(a,b){ return (b.z-a.z)||(b.text.length-a.text.length); });
+    return out.slice(0,10); }
+"""
+
+POPUP_STATE_JS = OVERLAY_SCAN_JS + r"""
+(function(){
+    var out={};
+    var gb = document.querySelector('.greet-boss-container')||document.querySelector('.greet-boss-dialog');
+    out.greet_open = !!(gb && _ovVis(gb));
+    out.greet_text = (gb && _ovVis(gb)) ? (gb.innerText||'').replace(/\s+/g,' ').trim().slice(0,200) : '';
+    var overlays = _ovScan();
+    if(overlays.length){ var top=overlays[0]; out.popup=true; out.popup_text=top.text; out.popup_cls=top.cls;
+        var btns=[]; var b=document.querySelectorAll('button,a,span,[role=button]');
+        for(var j=0;j<b.length;j++){var bt=(b[j].textContent||'').trim(); if(bt) btns.push(bt);}
+        out.popup_buttons=btns;
+    } else { out.popup=false; out.popup_text=''; }
+    var bodyTxt=(document.body.innerText||'').replace(/\s+/g,' ');
+    var limitKw=['您已达到沟通上限','您今天已与','沟通上限','已与150位','休息一下，明天再来',
+                 '达到上限','已达上限','今日沟通次数','沟通次数已','今日已向'];
+    out.body_has_limit=false; out.limit_phrase='';
+    for(var k=0;k<limitKw.length;k++){ if(bodyTxt.indexOf(limitKw[k])>=0){ out.body_has_limit=true; out.limit_phrase=limitKw[k]; break; } }
+    var box=document.querySelector('#main .job-detail')||document;
+    var els=box.querySelectorAll('button,a');
+    for(var i=0;i<els.length;i++){var t=(els[i].textContent||'').trim();
+        if(t.indexOf('沟通')>=0||t.indexOf('送达')>=0){out.btn=t;break;}}
+    out.overlays=overlays;
+    return JSON.stringify(out);
+})()
+"""
+
+VISIBLE_OVERLAYS_JS = OVERLAY_SCAN_JS + r"""
+(function(){
+    var ov=_ovScan();
+    var bodyTxt=(document.body.innerText||'').replace(/\s+/g,' ');
+    var limitKw=['您已达到沟通上限','您今天已与','沟通上限','已与150位','休息一下，明天再来',
+                 '达到上限','已达上限','今日沟通次数','沟通次数已','今日已向'];
+    var hit=null; for(var k=0;k<limitKw.length;k++){ if(bodyTxt.indexOf(limitKw[k])>=0){ hit=limitKw[k]; break; } }
+    return JSON.stringify({overlay_count:ov.length, overlays:ov, body_has_limit:!!hit, limit_phrase:hit||''}, null, 1);
+})()
+"""
+
+POPUP_ALLOW_CLOSE = ["留在此页", "继续沟通", "取消", "关闭", "我知道了", "稍后", "暂不", "X"]
+
+
+def read_popup_type(session=SESSION):
+    """只读识别当前弹窗类型，不点任何按钮。"""
+    try:
+        info = json.loads(evaluate(POPUP_STATE_JS) or "{}")
+    except Exception:
+        return ""
+    if not info.get("popup") and not info.get("greet_open"):
+        return ""
+    txt = (info.get("popup_text") or "") + " || " + (info.get("greet_text") or "")
+    if "选择原因" in txt or "减少不合适职位推荐" in txt or "不感兴趣" in txt:
+        return "not_interested"
+    if "上传附件简历" in txt or "在线填写" in txt or "拖拽文件" in txt:
+        return "resume_guide"
+    if "已向BOSS发送消息" in txt or "已发送" in txt or "[送达]" in txt or "已送达" in txt        or "留在此页" in txt or "继续沟通" in txt:
+        return "greet_sent"
+    if "好" in txt or "确定" in txt or "我知道了" in txt or "继续加油" in txt:
+        # 非致命提示弹窗（如第120份鼓励/提示弹窗），交由 safe_close_popup 点掉继续
+        return "tip"
+    for kw in ["已达上限", "达到上限", "今日上限", "投递上限", "已达150", "已达 150",
+               "今日已投递", "次数已达", "今日投递", "沟通上限", "已与150位",
+               "您已达到沟通上限", "休息一下，明天再来"]:
+        if kw in txt:
+            return "daily_limit"
+    if info.get("body_has_limit"):
+        return "daily_limit"
+    return "unknown"
+
+
+def click_popup_button(button_text, session=SESSION):
+    """原生点击弹窗内文字匹配的按钮（WebBridge 真实鼠标点击，比合成 .click() 可靠）。
+
+    匹配严格化（修复点错/点空隐患）：
+      - 仅限 button / a 元素——弹窗按钮都是真按钮或链接；外层 div/span 的 textContent
+        也包含按钮文字，若命中容器会点到"空壳"导致按钮没真正触发。
+      - 优先【精确匹配】可见文字；无精确匹配才退回【包含匹配】，且只对叶子节点
+        (children.length===0) 匹配，坚决避免命中包裹容器。
+    """
+    tag = evaluate(r"""(function(){
+        var target=%s;
+        var all=document.querySelectorAll('button,a');
+        for(var i=0;i<all.length;i++){ var t=(all[i].textContent||'').trim();
+            if(t===target){ all[i].id='__popbtn__'; return 'tagged'; } }
+        for(var i=0;i<all.length;i++){ var el=all[i];
+            if(el.children.length>0) continue;
+            var t=(el.textContent||'').trim();
+            if(t.indexOf(target)>=0){ el.id='__popbtn__'; return 'tagged'; } }
+        return 'NO_BTN';
+    })()""" % json.dumps(button_text))
+    if tag != 'tagged':
+        return 'NO_BTN:'+button_text
+    ok = click('#__popbtn__')
+    evaluate(r"(function(){var e=document.getElementById('__popbtn__'); if(e) e.removeAttribute('id');})()")
+    time.sleep(1.5)
+    return ('CLICKED:'+button_text) if ok else 'CLICK_FAIL'
+
+
+def safe_close_popup(session=SESSION):
+    ptype = read_popup_type(session)
+    if ptype == "resume_guide":
+        r = _click_text("没有附件简历", session)
+        if not r.startswith("CLICKED"):
+            click_popup_button("X", session)
+        return ptype
+    if ptype == "greet_sent":
+        click_popup_button("留在此页", session)
+        return ptype
+    if ptype == "not_interested":
+        r = click_popup_button("X", session)
+        if not r.startswith("CLICKED"):
+            click_popup_button("取消", session)
+        return ptype
+    if ptype == "tip":
+        # 第120份等非致命提示弹窗：点掉继续，不计入成功/失败
+        for bt in ("我知道了", "知道了", "好", "确定"):
+            r = click_popup_button(bt, session)
+            if r and r.startswith("CLICKED"):
+                break
+        return ptype
+    if ptype == "daily_limit":
+        return ptype
+    return ptype
+
+
+def _click_text(text_sub, session=SESSION):
+    """原生点击文字精确匹配的元素（WebBridge 真实鼠标点击）。"""
+    tag = evaluate(r"""(function(){
+        var t=%s;
+        var all=document.querySelectorAll('a,span,div,button,em,i,label,p,[role=button]');
+        for(var i=0;i<all.length;i++){ var el=all[i];
+            if(el.children.length===0 && (el.textContent||'').trim()===t){ el.id='__txtbtn__'; return 'tagged'; } }
+        return 'NO';
+    })()""" % json.dumps(text_sub))
+    if tag != 'tagged':
+        return 'NO:'+text_sub
+    ok = click('#__txtbtn__')
+    evaluate(r"(function(){var e=document.getElementById('__txtbtn__'); if(e) e.removeAttribute('id');})()")
+    time.sleep(1.2)
+    return ('CLICKED:'+text_sub) if ok else 'CLICK_FAIL'
+
+
+def auto_handle_popups(session, max_rounds=6):
+    last_type = ""
+    for _ in range(max_rounds):
+        ptype = read_popup_type(session)
+        last_type = ptype
+        if ptype == "":
+            return json.loads(evaluate(POPUP_STATE_JS) or "{}"), "clean", ""
+        if ptype == "daily_limit":
+            return json.loads(evaluate(POPUP_STATE_JS) or "{}"), "limit", "daily_limit"
+        if ptype in ("not_interested", "unknown"):
+            return json.loads(evaluate(POPUP_STATE_JS) or "{}"), "danger", ptype
+        safe_close_popup(session)
+        time.sleep(0.8)
+    return json.loads(evaluate(POPUP_STATE_JS) or "{}"), "forced", last_type
+
+
+CLICK_CHAT_JS = r"""
+(function(){
+    var box = document.querySelector('#main .job-detail') || document;
+    var els = box.querySelectorAll('button, a');
+    for (var i=0;i<els.length;i++){
+        var t=(els[i].textContent||'').trim();
+        if (t==='立即沟通'){ els[i].click(); return 'CLICKED:'+els[i].tagName; }
+    }
+    return 'NO_BTN';
+})()
+"""
+
+VERIFY_DELIVERED_JS = r"""
+(function(){
+    var box = document.querySelector('#main .job-detail') || document;
+    var els = box.querySelectorAll('button,a');
+    var btnText = '';
+    for (var i=0;i<els.length;i++){
+        var t=(els[i].textContent||'').trim();
+        if (t.indexOf('沟通')>=0 || t.indexOf('送达')>=0){ btnText=t; break; }
+    }
+    var body = (document.body.innerText||'');
+    var hasDelivery = body.indexOf('[送达]') >= 0 || body.indexOf('已送达') >= 0;
+    var delivered = (btnText && btnText !== '立即沟通' && btnText.indexOf('立即') < 0) || hasDelivery;
+    return JSON.stringify({delivered:delivered, btn:btnText, hasDelivery:hasDelivery});
+})()
+"""
+
+
+def _feedback(label, session=SESSION):
+    """每步操作后回读 DOM，打印当前落点/按钮/弹窗类型（反馈机制，杜绝'以为'与'实际'脱节）。"""
+    url, body, blen = snapshot_page(session=session)
+    btn = ""
+    ptype = ""
+    try:
+        d = json.loads(evaluate(POPUP_STATE_JS) or "{}")
+        btn = d.get("btn", "")
+        ptype = read_popup_type(session)
+    except Exception:
+        pass
+    on_chat = "/chat" in url
+    print(f"[feedback] {label} | URL={url[:72]} | btn={btn!r} | popup={ptype} | chat={on_chat}")
+    return url, btn, ptype, on_chat
+
+
+def _ensure_recommend(session=SESSION):
+    """确保在工作页（推荐页 或 行业搜索页）；若不在则导航过去一次（投递循环内仅首次会真正导航，之后全程停留）。
+    工作页 URL 路径均为 /web/geek/jobs（推荐页与搜索页同路径，仅 query 不同），
+    故以该路径判定是否已在工作页；严禁 navigate 到 job_detail 详情 URL。
+    """
+    url, _, _ = snapshot_page(session=session)
+    if "/web/geek/jobs" not in (url or ""):
+        is_search = WORKING_URL != RECOMMEND_URL
+        navigate(WORKING_URL, wait_range=(3, 5), session=session,
+                 expect_url_contains=("query=" if is_search else "header-jobs"),
+                 label="工作页")
+        time.sleep(1)
+    return True
+
+
+def _select_card_on_recommend(jid, session=SESSION, max_scroll=10):
+    """在推荐页【左侧列表内原地】选中 jid 对应卡片：滚动让卡片可见 → WebBridge 原生点击其岗位链接。
+    返回 True/False。全程不离开推荐页（绝不 navigate 到 job_detail URL）。
+    """
+    sel = f'a[href*="job_detail/{jid}"]'
+    for attempt in range(max_scroll):
+        # 先滚动让该卡片进入视口（原生点击前需可见）
+        evaluate(r"""(function(){
+            var el=document.querySelector('a[href*="job_detail/%s"]');
+            if(el){ el.scrollIntoView({block:'center'}); }
+            return !!el;
+        })()""" % jid)
+        time.sleep(0.8)
+        ok = click(sel)
+        if ok:
+            time.sleep(2.0)
+            return True
+        # 没点到 → 滚动左侧岗位列表加载更多卡片后重试
+        evaluate(r"""(function(){
+            var el=document.querySelector('a[href*="job_detail/%s"]');
+            if(el){
+                var p=el.parentElement;
+                while(p && p!==document.body){
+                    if(p.scrollHeight > p.clientHeight+4 && p.clientHeight>0){ p.scrollTop+=800; return; }
+                    p=p.parentElement;
+                }
+            }
+            window.scrollBy(0,800);
+        })()""" % jid)
+        time.sleep(1.2)
+    return False
+
+
+def _panel_shows_job(jid, title, session=SESSION):
+    """校验右侧面板当前显示的是目标岗位。
+
+    权威依据：右侧面板『立即沟通』按钮的 ka 属性必须含目标 jid。
+    ⚠️ 严禁用 `title in document.body.innerText` 兜底——左侧列表本就罗列所有岗位标题，
+    该判断永远为真，会掩盖'面板没切到目标岗'的脱钩，导致向错误岗位投递却记成成功。
+    """
+    ka = evaluate(r"""(function(){
+        var box=document.querySelector('#main .job-detail')||document;
+        var els=box.querySelectorAll('button,a');
+        for(var i=0;i<els.length;i++){ var t=(els[i].textContent||'').trim();
+            if(t==='立即沟通'){ return els[i].getAttribute('ka')||''; } }
+        return '';
+    })()""")
+    if ka and jid and jid in ka:
+        return True
+    return False
+
+
+def _verify_delivered_on_page(session=SESSION):
+    """页面停留在岗位详情页时，确认投递已生效：按钮变'继续沟通'或正文含送达。"""
+    try:
+        d = json.loads(evaluate(POPUP_STATE_JS) or "{}")
+        btn = (d.get("btn") or "")
+        body = evaluate("document.body.innerText") or ""
+        if "继续沟通" in btn or "继续沟通" in body[:400] or "[送达]" in body or "已送达" in body:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def card_exists(jid, session=SESSION):
+    """当前 DOM 中是否存在目标岗位的卡片链接（用于判断该岗在当前页是否可定位）。"""
+    sel = f'a[href*="job_detail/{jid}"]'
+    r = evaluate(f'(function(){{return !!document.querySelector({json.dumps(sel)});}})()')
+    return str(r).strip().lower() in ("true", "1", "yes")
+
+
+def _try_locate_card(jid, title, session=SESSION, max_rounds=6):
+    """在【当前已导航到的工作页】上定位并选中目标卡片（含滚动加载更多）。
+
+    返回:
+      - 'ok'     : 已点击且右侧面板确已切到目标岗（可继续点'立即沟通'）
+      - 'absent' : 滚动加载后卡片仍不在 DOM（该页确实没有此岗 → 应跳过，不中止整批）
+      - 'timing' : 卡片在 DOM 但面板始终未切换（SPA 时序异常 → 为安全计也按跳过处理）
+    """
+    for _r in range(max_rounds):
+        if not card_exists(jid, session):
+            # 卡片不在当前 DOM → 滚动加载更多后重试
+            scroll_jobs_list(session=session)
+            time.sleep(1.3)
+            if not card_exists(jid, session):
+                # 多次滚动后仍无 → 认定该页无此卡
+                return "absent"
+            continue
+        ok_sel = _select_card_on_recommend(jid, session=session)
+        if not ok_sel:
+            time.sleep(1.0)
+            continue
+        if _panel_shows_job(jid, title, session=session):
+            return "ok"
+        time.sleep(1.2)  # 面板未切换 → 等 SPA 渲染后重试
+    return "timing" if card_exists(jid, session) else "absent"
+
+
+def deliver_click(job, session=SESSION, auto=True):
+    """在【推荐页内原地】完成一次投递：
+      定位该 jid 的卡片 → 点击选中(右侧切JD) → 点'立即沟通' → 成功弹窗点'留在此页' → 校验仍在推荐页。
+
+    用户手把手纠正后的铁律：
+      - 全程不离开推荐页：绝不 navigate 到 job_detail URL（缺 securityId 会重定向、且会刷新列表导致错位）。
+      - 选中卡片用 WebBridge 原生 click（dispatchEvent 合成事件无法触发 SPA 切换面板）。
+      - 每步回读 DOM 反馈(_feedback)确认'我做的=实际发生的'，杜绝脱钩。
+      - 成功弹窗【只点'留在此页'】，绝不点'继续沟通'（后者进聊天界面、返回会刷新乱序）。
+    """
+    jid = job.get("jobId")
+    title = (job.get("title") or "").strip()
+    # 0) 先清理上一封可能遗留的弹窗
+    safe_close_popup(session)
+    time.sleep(0.6)
+    # 1) 在当前来源页（search/recommend，由 WORKING_URL 决定）定位目标卡片
+    _ensure_recommend(session)
+    res = _try_locate_card(jid, title, session=session)
+    if res != "ok":
+        # 当前来源页未找到该卡（BOSS 搜索结果动态变化，卡片可能已不在 DOM）。
+        return {"not_found": True, "jid": jid,
+                "reason": f"卡片[{jid}]({title})在当前来源页未找到（BOSS搜索结果动态变化），交由上层决定是否回退推荐页"}
+    _feedback(f"已选中卡片[{jid}]", session)
+    # 2) 点'立即沟通'
+    print(f"[stream] 点击'立即沟通'：{job.get('title')}")
+    r = evaluate(CLICK_CHAT_JS)
+    time.sleep(1.5)
+    _feedback("已点立即沟通", session)
+    is_anom, detail = detect_page_anomaly(allow_login_wall=False, check_blank=False)
+    if is_anom:
+        return {"anomaly": detail}
+    if not auto:
+        return json.loads(evaluate(POPUP_STATE_JS) or "{}")
+    # 3) 等待弹窗 / 反馈（含错误路径检测）
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        ptype = read_popup_type(session)
+        if ptype == "not_interested":
+            raise AbortScriptError("误触『不感兴趣』弹窗，整批停止待人工介入")
+        if ptype == "daily_limit":
+            st = json.loads(evaluate(POPUP_STATE_JS) or "{}")
+            st["daily_limit"] = "daily_limit"
+            return st
+        if ptype == "resume_guide":
+            safe_close_popup(session)
+            continue
+        if ptype == "tip":
+            # 第120份等非致命提示弹窗：点掉继续，不计入成功/失败
+            safe_close_popup(session)
+            time.sleep(0.8)
+            continue
+        if ptype == "greet_sent":
+            # 成功弹窗（含'留在此页/继续沟通'）→【只点'留在此页'】留在推荐页（正确路径）
+            click_popup_button("留在此页", session)
+            time.sleep(1.2)
+            url, btn, ptype2, on_chat = _feedback("点'留在此页'后", session)
+            if on_chat:
+                # 极端兜底：被带进聊天页（理论不该发生）→ 记成功并纠正回推荐页
+                _ensure_recommend(session)
+                return {"delivered_ok": True, "wrong_path": True}
+            # 成功弹窗即等于投递成功；面板/按钮校验仅作附加确认
+            ok = _verify_delivered_on_page(session) or _panel_shows_job(jid, title, session=session)
+            return {"delivered_ok": True, "verify": ok}
+        # 检测错误路径：页面直接进了聊天（没弹窗但 URL 变 /chat）
+        url, _, _ = snapshot_page(session=session)
+        if "/chat" in url:
+            # 投递成功但走了'继续沟通'错误路径 → 记成功，返回推荐页纠正
+            _ensure_recommend(session)
+            return {"delivered_ok": True, "wrong_path": True}
+        if ptype == "unknown":
+            raise AbortScriptError("出现未知弹窗，整批停止待人工介入")
+        time.sleep(1.0)
+    # 超时：再确认一次按钮是否变'继续沟通'/送达
+    ok = _verify_delivered_on_page(session)
+    url, _, _ = snapshot_page(session=session)
+    if "/chat" in url:
+        _ensure_recommend(session)
+        return {"delivered_ok": True, "wrong_path": True, "timeout": True}
+    return {"delivered_ok": ok, "timeout": True}
+
+
+def verify_delivered(session=SESSION):
+    try:
+        d = json.loads(evaluate(VERIFY_DELIVERED_JS) or "{}")
+        ok = d.get("delivered", False)
+        detail = f"btn={d.get('btn','')} delivery={d.get('hasDelivery',False)}"
+    except Exception:
+        ok, detail = False, "verify_error"
+    return ok, detail
+
+
+def verify_against_account(session=SESSION, expected=None):
+    """【独立诊断，非投递主流程】导航到 BOSS 真实沟通列表，读取已投递会话，作为【落地真相】
+    与本地 progress 交叉核对，暴露'本地记了但真实账号没有'的脱钩问题。
+
+    ⚠️ 铁律：本函数【绝不】出现在投递主流程里（投递全程停在推荐页、绝不打开聊天页）。
+    它只应被显式触发（--mode verify）。读完后【立即导航回推荐页】，
+    确保会话最终停留在推荐页，绝不把页面停在 /chat。
+    """
+    try:
+        navigate("https://www.zhipin.com/web/geek/chat", wait_range=(3, 5),
+                 session=session, expect_url_contains="chat", label="沟通列表")
+    except Exception as e:
+        return f"(无法打开沟通列表: {e})", (expected or [])
+    time.sleep(1.5)
+    body = evaluate("document.body.innerText") or ""
+    missing = []
+    if expected:
+        for item in expected:
+            # item 为 (title, company) 或纯 title 字符串
+            if isinstance(item, (list, tuple)):
+                title = item[0] if len(item) > 0 else ""
+                company = item[1] if len(item) > 1 else ""
+            else:
+                title = item or ""
+                company = ""
+            # 聊天列表显示 HR/公司名（非岗位标题），优先按公司名匹配，其次岗位标题
+            key = (company[:6] if company else "") or (title[:6] if title else "")
+            if key and key not in body:
+                missing.append(title or company)
+    # 读完后立即回到推荐页，绝不把会话停在聊天页
+    try:
+        navigate(RECOMMEND_URL, wait_range=(3, 5), session=session,
+                 expect_url_contains="header-jobs", label="回推荐页")
+    except Exception:
+        pass
+    return body, missing
+
+
+def run_verify(workdir, session=SESSION):
+    """独立诊断模式：仅核对本地已投递记录与真实沟通列表，读后自动回到推荐页。"""
+    progress_file = os.path.join(workdir, "stream_progress.json")
+    pm = ProgressManager(progress_file)
+    pm.load()
+    delivered = pm.data.get("delivered", [])
+    if not delivered:
+        print("[verify] 本地无已投递记录，无需核对")
+        return
+    items = [(d.get("title", ""), d.get("company", "")) for d in delivered]
+    _ensure_recommend(session)  # 起点确保在推荐页
+    chat_body, missing = verify_against_account(session=session, expected=items)
+    print(f"[verify] 本地已投递 {len(items)} 份，真实沟通列表核对：")
+    if missing:
+        print(f"[verify] ⚠️ 未找到（本地记了但真实列表没有）：{missing}")
+    else:
+        print("[verify] ✅ 全部在真实沟通列表中找到")
+
+
+# ───────────────────────────────────────────────────────────
+# 收尾闭环：投递成果汇报 + 打赏（二合一自包含 HTML）
+# ───────────────────────────────────────────────────────────
+def write_summary_page(workdir, profile=None):
+    """【收尾闭环 · 必做】生成本轮「投递成果汇报 + 打赏」二合一自包含 HTML。
+
+    读取 workdir/stream_progress.json 中已投递记录，按 direction 分组，
+    嵌入微信/支付宝赞赏码（base64 内嵌，单文件自包含），输出 投递汇总.html。
+    每次投递任务结束 MUST 调用本函数并 present_files 展示该页。
+
+    方向分组依据：每条投递记录自带 direction 字段（deliver 第5参数写入）；
+    缺失时回退 industry → '其他'，保证历史数据也能正常出页。
+    """
+    import base64, re, datetime
+    prog = os.path.join(workdir, "stream_progress.json")
+    if not os.path.exists(prog):
+        return None
+    with open(prog, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    delivered = data.get("delivered", [])
+
+    def dir_of(j):
+        return (j.get("direction") or j.get("industry") or "其他").strip() or "其他"
+
+    groups = {}
+    for j in delivered:
+        groups.setdefault(dir_of(j), []).append(j)
+    order = sorted(groups.keys(), key=lambda c: (-len(groups[c]), c))  # 多者在前
+
+    def sal_low(s):
+        m = re.search(r"(\d+)-(\d+)K", s or "")
+        return int(m.group(1)) if m else 0
+
+    total = len(delivered)
+    prof = profile or {}
+    floor = prof.get("min_salary_k")
+    city = prof.get("target_city") or "—"
+    low = [j for j in delivered if floor and sal_low(j.get("salary", "")) < int(floor)] if floor else []
+
+    rows_html = []
+    for cat in order:
+        items = groups[cat]
+        rows_html.append(f'<h2 class="cat">{cat} <span class="cnt">×{len(items)}</span></h2>')
+        rows_html.append('<table><thead><tr><th>#</th><th>岗位</th><th>公司</th><th>薪资</th><th>行业</th></tr></thead><tbody>')
+        for idx, j in enumerate(items, 1):
+            rows_html.append(
+                f"<tr><td>{idx}</td><td>{j.get('title','')}</td><td>{j.get('company','')}</td>"
+                f"<td>{j.get('salary','')}</td><td>{j.get('industry','')}</td></tr>"
+            )
+        rows_html.append("</tbody></table>")
+
+    cats_summary = "".join(f"<span class='pill'>{c}×{len(groups[c])}</span>" for c in order)
+
+    def b64img(name):
+        p = os.path.join(SKILL_DIR, "assets", name)
+        if not os.path.exists(p):
+            return ""
+        with open(p, "rb") as fh:
+            return "data:image/jpeg;base64," + base64.b64encode(fh.read()).decode("ascii")
+    wx = b64img("tip_wechat.jpg")
+    ali = b64img("tip_alipay.jpg")
+
+    now = datetime.datetime.now().strftime('%Y-%m-%d %H:%M')
+    floor_txt = f"{floor}K" if floor else "—"
+    low_note = (f"<br><b class='warn'>注意：</b>有 {len(low)} 份薪资下限低于门槛 {floor_txt}，请人工核对。"
+                if low else "")
+    html = f"""<!doctype html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BOSS 投递成果汇报 · 本轮 {total} 份</title>
+<style>
+*{{box-sizing:border-box}}
+body{{font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;background:#eef2f7;color:#222;margin:0;padding:26px 14px 60px}}
+.wrap{{max-width:880px;margin:0 auto}}
+h1{{font-size:25px;color:#1763c9;margin:0 0 4px}}
+.sub{{color:#7a869a;font-size:13.5px;margin-bottom:16px;line-height:1.6}}
+.banner{{background:linear-gradient(135deg,#1763c9,#36a3ff);color:#fff;border-radius:16px;padding:22px 26px;margin-bottom:18px;box-shadow:0 8px 22px rgba(23,99,201,.25)}}
+.banner .big{{font-size:36px;font-weight:800;letter-spacing:.5px}}
+.banner .small{{font-size:13.5px;opacity:.94;margin-top:8px;line-height:1.6}}
+.pills{{margin:6px 0 8px;line-height:2.4}}
+.pill{{display:inline-block;background:#eaf2ff;color:#1763c9;border:1px solid #cfe2ff;border-radius:20px;padding:4px 12px;font-size:12.5px;margin:3px 6px 3px 0}}
+.card{{background:#fff;border-radius:14px;padding:18px 20px;margin:16px 0;box-shadow:0 2px 10px rgba(20,40,80,.06)}}
+.cat{{font-size:17px;color:#0f3d7a;margin:18px 0 8px;border-left:4px solid #36a3ff;padding-left:10px}}
+.cat .cnt{{color:#36a3ff;font-size:14px;font-weight:600}}
+table{{width:100%;border-collapse:collapse;background:#fff;border-radius:10px;overflow:hidden;border:1px solid #eef1f5}}
+th,td{{text-align:left;padding:9px 12px;font-size:13px;border-bottom:1px solid #eef1f5}}
+th{{background:#f0f5fc;color:#345;font-weight:600}}
+tr:last-child td{{border-bottom:none}}
+tr:hover td{{background:#f7faff}}
+.note{{background:#fff8ec;border:1px solid #ffe2b8;border-radius:12px;padding:14px 18px;font-size:13px;color:#8a5a00;margin-top:18px;line-height:1.8}}
+.warn{{color:#c0392b;font-weight:600}}
+.reward{{margin-top:26px;background:linear-gradient(160deg,#fff7f0,#ffe9df);border:1px solid #ffd9c7;border-radius:18px;padding:26px 20px 30px;text-align:center}}
+.reward h2{{font-size:22px;color:#e8543a;margin:0 0 8px}}
+.reward .lead{{font-size:14.5px;color:#8a5a44;line-height:1.85;margin:0 auto 18px;max-width:560px}}
+.qrbox{{display:flex;flex-direction:column;gap:18px;align-items:center}}
+.qr{{background:#fff;border:1px solid #ffe0cf;border-radius:16px;padding:14px;box-shadow:0 4px 14px rgba(232,84,58,.12)}}
+.qr img{{width:240px;height:240px;max-width:72vw;display:block;border-radius:8px}}
+.qr div{{margin-top:10px;font-size:14.5px;color:#b8432c;font-weight:700}}
+.foot{{margin-top:22px;font-size:12px;color:#c59a86}}
+.divider{{text-align:center;color:#b9c2d0;font-size:12px;margin:30px 0 4px;letter-spacing:2px}}
+</style></head><body>
+<div class="wrap">
+<h1>📊 BOSS 直聘 · 本轮投递成果汇报</h1>
+<div class="sub">生成时间：{now} ｜ 工作地：{city} ｜ 薪资门槛：≥{floor_txt} ｜ 流程：推荐页优先 + 关键词补刀 + AI 语义终审</div>
+<div class="banner"><div class="big">✅ 实投 {total} 份</div><div class="small">全部 verify:true（回读页面确认送达、停留推荐/搜索页未跳转 /chat）· 覆盖 {len(order)} 个方向</div></div>
+<div class="card">
+<div class="pills">{cats_summary}</div>
+{''.join(rows_html)}
+<div class="note">
+<b>投递说明：</b>本轮共实投 <b>{total}</b> 份，覆盖 <b>{len(order)}</b> 个方向；全部 verify:true（回读页面确认送达、停留推荐/搜索页未跳转 /chat）。
+每条岗位均由 AI 语义终审依据你的求职意向（user_profile 的 prefer/avoid）实时判读，不符合方向的岗位据 JD 实录判否、不凑数。{low_note}
+</div>
+</div>
+<div class="divider">— 以 下 为 打 赏 环 节 —</div>
+<div class="reward">
+<h2>✨ 觉得有用？欢迎打赏支持 ✨</h2>
+<p class="lead">本工具持续帮你精准投递、解放重复劳动。<br>如果你在求职路上用得顺手，欢迎用微信或支付宝扫码打赏——<br>你的支持是我持续优化、免费分享的动力 ❤️</p>
+<div class="qrbox">
+{"<div class='qr'><img src='"+wx+"'><div>微信赞赏码</div></div>" if wx else ""}
+{"<div class='qr'><img src='"+ali+"'><div>支付宝赞赏码</div></div>" if ali else ""}
+</div>
+<p class="foot">打赏完全自愿 · 感谢每一份支持</p>
+</div>
+</div>
+</body></html>"""
+    html_path = os.path.join(workdir, "投递汇总.html")
+    with open(html_path, "w", encoding="utf-8") as f:
+        f.write(html)
+    return html_path
+
+
+# ───────────────────────────────────────────────────────────
+# 使用须知 / 首次运行引导
+# ───────────────────────────────────────────────────────────
+def print_usage_notice():
+    notice = (
+        "\n╔══════════════════════════════════════════════════════════════╗\n"
+        "║          📋 BOSS 直聘投递技能 · 使用须知（必读）              ║\n"
+        "╠══════════════════════════════════════════════════════════════╣\n"
+        "║  ✅ 本技能定位：替你完成「机械重复的浏览+投递」，             ║\n"
+        "║     最终「该不该投」由 AI 语义判断（基于你填写的求职意向）。      ║\n"
+        "║                                                            ║\n"
+        "║  ❌ 绝非鼓励无脑海投：                                       ║\n"
+        "║     · 请勿高频滥用（建议每日 ≤50 次沟通）                     ║\n"
+        "║     · 请勿对明显不匹配的岗位投递，避免污染你的求职画像        ║\n"
+        "║     · 请勿刻意绕过平台反滥用机制                             ║\n"
+        "║                                                            ║\n"
+        "║  ⚙️  使用前必做：在 user_profile.json 填写你的求职方向         ║\n"
+        "║     （role_summary / prefer / avoid），让 AI 审核有依据。     ║\n"
+        "║                                                            ║\n"
+        "║  🛡️  安全机制：每次投递都回读页面确认「送达」才继续；        ║\n"
+        "║     遇未知弹窗/误触/日上限 立即整批停手，绝不无脑继续。       ║\n"
+        "╚══════════════════════════════════════════════════════════════╝\n"
+        "   三步上手：① 填 user_profile.json → ② 准备环境(Chrome/WebBridge/登录) → ③ 运行本技能\n"
+    )
+    print(notice)
+
+
+# ───────────────────────────────────────────────────────────
+# 平台级常量（与筛选无关，仅为安全护栏）
+# ───────────────────────────────────────────────────────────
+DAILY_CAP = 150
+FAIL_BREAKER = 3
+
+DAILY_LIMIT_JS = r"""
+(function(){
+    var txt = (document.body.innerText||'');
+    var dlg = document.querySelector('.dialog-content,.dialog-wrap,.dialog-box,.dialog-container,[class*=dialog]');
+    if (dlg) txt = txt + ' || ' + (dlg.innerText||'');
+    var patterns = ['已达上限','达到上限','今日上限','投递上限','已达150','已达 150','今日已投递','次数已达','今日投递','沟通上限','已与150位','您已达到沟通上限','休息一下，明天再来','您今天已与'];
+    var hit = null;
+    for (var i=0;i<patterns.length;i++){ if (txt.indexOf(patterns[i])>=0){ hit = patterns[i]; break; } }
+    return JSON.stringify({hit: hit});
+})()
+"""
+
+
+def detect_daily_limit(session=SESSION):
+    try:
+        d = json.loads(evaluate(DAILY_LIMIT_JS) or "{}")
+        hit = d.get("hit")
+        return bool(hit), hit or ""
+    except Exception:
+        return False, "detect_error"
+
+
+# ───────────────────────────────────────────────────────────
+# 入口（仅收尾/诊断；投递主流程在 _live_driver.py）
+# ───────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    import argparse
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+    ap = argparse.ArgumentParser(description="BOSS 直聘投递 · 收尾/诊断（实时投递见 _live_driver.py）")
+    ap.add_argument("--workdir", required=True)
+    ap.add_argument("--mode", default="report", choices=["verify", "report"])
+    ap.add_argument("--diag", action="store_true",
+                    help="诊断模式：只读 dump 所有可见浮层 + 弹窗分类 + 日上限检测，不投递")
+    a = ap.parse_args()
+
+    profile = load_profile()
+
+    if a.diag:
+        print_usage_notice()
+        print("[diag] 进入诊断模式（只读，不投递）")
+        _env = check_env(verbose=True)
+        if not _env.ok:
+            print("[diag] ⚠️ 环境异常，诊断结果可能不准确")
+        navigate(RECOMMEND_URL, wait_range=(3, 5), session=SESSION,
+                 expect_url_contains="header-jobs", label="推荐页")
+        time.sleep(3)
+        ov = json.loads(evaluate(VISIBLE_OVERLAYS_JS) or "{}")
+        ptype = read_popup_type(SESSION)
+        is_limit, lp = detect_daily_limit(SESSION)
+        full = json.loads(evaluate(POPUP_STATE_JS) or "{}")
+        report = {
+            "read_popup_type": ptype,
+            "detect_daily_limit": {"hit": is_limit, "phrase": lp},
+            "visible_overlays": ov,
+            "popup_state_full": full,
+        }
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+        diag_file = os.path.join(a.workdir, f"diag_{int(time.time())}.json")
+        try:
+            json.dump(report, open(diag_file, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+            print(f"[diag] 报告已写入 {diag_file}")
+        except Exception as e:
+            print(f"[diag] 写文件失败: {e}")
+        sys.exit(0)
+
+    if a.mode == "verify":
+        run_verify(a.workdir, session=SESSION)
+    elif a.mode == "report":
+        # 收尾闭环：合并「投递成果汇报 + 打赏」二合一自包含页
+        out = write_summary_page(a.workdir, profile=profile)
+        if not out:
+            print("[report] ⚠️ 未找到 stream_progress.json，无法生成汇报页")
+            sys.exit(1)
+        print(f"[report] 已生成合并汇报页：{out}")

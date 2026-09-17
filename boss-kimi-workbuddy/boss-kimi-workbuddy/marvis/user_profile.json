@@ -1,0 +1,18 @@
+{
+  "user_name": "",
+  "role_summary": "",
+  "experience": "",
+  "domain_description": "Describe your target industry and preferred job directions, e.g.: Hospitality/tourism industry, hotel operations mgmt, event planning & execution.",
+  "target_city": "",
+  "city_code": "",
+  "min_salary_k": 0,
+  "daily_target": 5,
+  "session_name": "boss-main",
+  "_c_exclude_comment": "Optional: custom company name blacklist. Leave empty to use built-in defaults from config_v3.py.",
+  "_t_exclude_comment": "Optional: custom title exclusion keywords. Leave empty to use built-in defaults from config_v3.py.",
+  "prefer": [],
+  "avoid": [],
+  "prefer_no_big_company": true,
+  "prefer_no_headhunter": true,
+  "search_keywords": []
+}
